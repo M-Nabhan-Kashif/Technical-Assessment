@@ -89,16 +89,19 @@ const ProcessedVideoPlayer: React.FC<ProcessedVideoPlayerProps> = ({
     if (!video || !canvas) return;
 
     // Set canvas dimensions
+    // Define updateDimensions outside conditional so it can be referenced in cleanup
+    const updateDimensions = () => {
+      if (canvas) {
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+      }
+    };
+    
     if (width && height) {
       canvas.width = width;
       canvas.height = height;
     } else {
       // Match video dimensions
-      const updateDimensions = () => {
-        canvas.width = video.videoWidth || 640;
-        canvas.height = video.videoHeight || 480;
-      };
-      
       if (video.videoWidth && video.videoHeight) {
         updateDimensions();
       } else {
@@ -163,6 +166,7 @@ const ProcessedVideoPlayer: React.FC<ProcessedVideoPlayerProps> = ({
       video.removeEventListener('play', handlePlay);
       video.removeEventListener('pause', handlePause);
       video.removeEventListener('seeked', handleSeeked);
+      video.removeEventListener('loadedmetadata', updateDimensions);
       
       if (animationFrameRef.current !== null) {
         cancelAnimationFrame(animationFrameRef.current);

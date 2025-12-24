@@ -244,10 +244,18 @@ export function useVideoProcessor(
           }));
         }
       } catch (error) {
+        // Stop polling on fetch errors (network issues, server unavailable, etc.)
+        if (pollingIntervalRef.current) {
+          clearInterval(pollingIntervalRef.current);
+          pollingIntervalRef.current = null;
+        }
+
         const errorMessage = error instanceof Error ? error.message : 'Failed to check processing status';
         setState((prev) => ({
           ...prev,
+          isProcessingFullVideo: false,
           error: errorMessage,
+          videoJobId: null,
         }));
       }
     },

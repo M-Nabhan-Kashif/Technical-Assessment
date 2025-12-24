@@ -9,7 +9,7 @@ from typing import Tuple, Optional, List
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing
 import pickle
-from queue import Queue
+from queue import Queue, Empty
 import threading
 
 # A lightweight face detection model (kept for backward compatibility)
@@ -18,6 +18,8 @@ face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fronta
 # MediaPipe Selfie Segmentation
 # Import will be done lazily in initialize_segmentation_model to handle import errors gracefully
 selfie_segmentation = None
+# Lock to protect thread-unsafe MediaPipe model access
+_segmentation_lock = threading.Lock()
 
 # Import segmentation configuration
 from segmentation_config import (
@@ -35,21 +37,48 @@ from segmentation_config import (
 )
 
 # Runtime config overrides for testing (set via API)
-_runtime_config = None
+# Use thread-local storage to prevent race conditions between concurrent requests
+# Each thread (request handler or video processing thread) has its own config
+_runtime_config_storage = threading.local()
 
-def set_runtime_config(config_overrides: dict):
+def set_runtime_config(config_overrides: Optional[dict]):
     """Set runtime configuration overrides for testing.
     
+    Thread-safe: Uses thread-local storage so each thread has its own config.
+    This prevents race conditions where a config set in one request thread
+    could affect concurrent video processing threads.
+    
     Args:
-        config_overrides: Dictionary with config keys and values to override
+        config_overrides: Dictionary with config keys and values to override.
+                         If None, clears the config for this thread.
+                         If empty dict {}, sets an empty config (no overrides).
     """
-    global _runtime_config
-    _runtime_config = config_overrides.copy() if config_overrides else None
+    if config_overrides is None:
+        # Clear config for this thread
+        if hasattr(_runtime_config_storage, 'config'):
+            delattr(_runtime_config_storage, 'config')
+    else:
+        # Set config (even if empty dict - means no overrides but config is set)
+        _runtime_config_storage.config = config_overrides.copy()
 
 def get_config_value(key: str, default_value):
-    """Get config value, using runtime override if available."""
-    if _runtime_config and key in _runtime_config:
-        return _runtime_config[key]
+    """Get config value, using runtime override if available.
+    
+    Thread-safe: Reads from thread-local storage, so each thread sees only
+    its own config overrides. Video processing threads that never set config
+    will always use default values.
+    
+    Args:
+        key: Configuration key to look up
+        default_value: Default value to return if no override is set
+        
+    Returns:
+        Override value if set for this thread, otherwise default_value
+    """
+    if hasattr(_runtime_config_storage, 'config'):
+        config = _runtime_config_storage.config
+        if config and key in config:
+            return config[key]
     return default_value
 
         
@@ -226,43 +255,46 @@ def initialize_segmentation_model():
     """
     Initialize the MediaPipe Selfie Segmentation model using Tasks API.
     This should be called once at application startup.
+    Thread-safe: uses a lock to prevent concurrent initialization.
     """
-    global selfie_segmentation
-    if selfie_segmentation is None:
-        try:
-            # Use MediaPipe 0.10.x Tasks API
-            from mediapipe.tasks import python
-            from mediapipe.tasks.python import vision
-            from mediapipe.tasks.python.vision.core import image as mp_image_module
-            
-            # Selfie segmentation model URL (MediaPipe's official model)
-            model_url = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/1/selfie_segmenter.tflite"
-            model_dir = os.path.join(os.path.dirname(__file__), "models")
-            model_path = os.path.join(model_dir, "selfie_segmenter.tflite")
-            
-            # Download model if needed
-            download_model_if_needed(model_url, model_path)
-            
-            # Create ImageSegmenter
-            base_options = python.BaseOptions(model_asset_path=model_path)
-            options = vision.ImageSegmenterOptions(
-                base_options=base_options,
-                output_confidence_masks=True
-            )
-            selfie_segmentation = vision.ImageSegmenter.create_from_options(options)
-            logger.info("MediaPipe Selfie Segmentation model initialized using Tasks API")
-        except ImportError as e:
-            logger.error(f"Failed to import MediaPipe Tasks API: {e}")
-            raise ImportError(f"MediaPipe Tasks API not available: {e}. Please ensure mediapipe>=0.10.0 is installed: pip install --upgrade mediapipe")
-        except Exception as e:
-            logger.error(f"Failed to initialize MediaPipe: {e}")
-            raise ImportError(f"MediaPipe initialization failed: {e}")
+    global selfie_segmentation, _segmentation_lock
+    with _segmentation_lock:
+        if selfie_segmentation is None:
+            try:
+                # Use MediaPipe 0.10.x Tasks API
+                from mediapipe.tasks import python
+                from mediapipe.tasks.python import vision
+                from mediapipe.tasks.python.vision.core import image as mp_image_module
+                
+                # Selfie segmentation model URL (MediaPipe's official model)
+                model_url = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/1/selfie_segmenter.tflite"
+                model_dir = os.path.join(os.path.dirname(__file__), "models")
+                model_path = os.path.join(model_dir, "selfie_segmenter.tflite")
+                
+                # Download model if needed
+                download_model_if_needed(model_url, model_path)
+                
+                # Create ImageSegmenter
+                base_options = python.BaseOptions(model_asset_path=model_path)
+                options = vision.ImageSegmenterOptions(
+                    base_options=base_options,
+                    output_confidence_masks=True
+                )
+                selfie_segmentation = vision.ImageSegmenter.create_from_options(options)
+                logger.info("MediaPipe Selfie Segmentation model initialized using Tasks API")
+            except ImportError as e:
+                logger.error(f"Failed to import MediaPipe Tasks API: {e}")
+                raise ImportError(f"MediaPipe Tasks API not available: {e}. Please ensure mediapipe>=0.10.0 is installed: pip install --upgrade mediapipe")
+            except Exception as e:
+                logger.error(f"Failed to initialize MediaPipe: {e}")
+                raise ImportError(f"MediaPipe initialization failed: {e}")
     return selfie_segmentation
 
 
 def segment_person(frame: np.ndarray, previous_mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Extract person mask from a video frame using MediaPipe Selfie Segmentation.
+    Thread-safe: uses a lock to protect MediaPipe model access.
     
     Args:
         frame: Input frame as numpy array (BGR format from OpenCV)
@@ -273,6 +305,8 @@ def segment_person(frame: np.ndarray, previous_mask: Optional[np.ndarray] = None
         - mask: Binary mask where 1 = person, 0 = background (3-channel, uint8 0-255)
         - segmented_person: Original frame with person pixels only
     """
+    global selfie_segmentation, _segmentation_lock
+    # Double-checked locking pattern: fast path check outside lock, initialization protected inside
     if selfie_segmentation is None:
         initialize_segmentation_model()
     
@@ -301,8 +335,10 @@ def segment_person(frame: np.ndarray, previous_mask: Optional[np.ndarray] = None
             data=rgb_frame
         )
         
-        # Process frame using Tasks API
-        results = selfie_segmentation.segment(mp_image)
+        # Process frame using Tasks API - protected by lock for thread-safety
+        # MediaPipe models are not thread-safe, so we must synchronize access
+        with _segmentation_lock:
+            results = selfie_segmentation.segment(mp_image)
         
         # Get confidence masks (first mask is typically the person/foreground)
         if results.confidence_masks and len(results.confidence_masks) > 0:
@@ -438,10 +474,12 @@ def apply_sepia_filter(frame: np.ndarray) -> np.ndarray:
         Frame with sepia tone applied
     """
     # Sepia transformation matrix
+    # Note: OpenCV uses BGR format, so columns correspond to [B, G, R] input channels
+    # Swapped first and third columns from RGB matrix to match BGR input order
     sepia_matrix = np.array([
-        [0.272, 0.534, 0.131],
-        [0.349, 0.686, 0.168],
-        [0.393, 0.769, 0.189]
+        [0.131, 0.534, 0.272],  # B' = 0.131*B + 0.534*G + 0.272*R
+        [0.168, 0.686, 0.349],  # G' = 0.168*B + 0.686*G + 0.349*R
+        [0.189, 0.769, 0.393]   # R' = 0.189*B + 0.769*G + 0.393*R
     ])
     
     # Apply sepia transformation
@@ -724,6 +762,8 @@ def process_video(video_path: str, output_path: str, filter_type: str = "graysca
     Returns:
         Tuple of (success: bool, message: str)
     """
+    cap = None
+    out = None
     try:
         # Open video
         cap = cv2.VideoCapture(video_path)
@@ -978,7 +1018,12 @@ def process_video(video_path: str, output_path: str, filter_type: str = "graysca
                                 progress = int((local_frame_count / clip_total_frames) * 100) if clip_total_frames > 0 else 0
                                 progress = min(100, max(0, progress))
                                 progress_callback(progress)
-                    except:
+                    except Empty:
+                        # Timeout waiting for queue item - continue loop
+                        continue
+                    except Exception as e:
+                        # Log unexpected errors but continue processing
+                        logger.warning(f"Unexpected error in write_frames loop: {e}")
                         continue
             except Exception as e:
                 processing_error[0] = e
@@ -1004,9 +1049,13 @@ def process_video(video_path: str, output_path: str, filter_type: str = "graysca
                         break
                     frame_data = frame_queue.get(timeout=0.1)
                     frame_buffer.append(frame_data)
-            except:
-                if not frame_buffer:
-                    break
+            except Empty:
+                # Timeout waiting for queue item - continue to check if we should continue outer loop
+                pass
+            except Exception as e:
+                # Log unexpected errors
+                logger.warning(f"Unexpected error collecting frame batch: {e}")
+                pass
             
             if not frame_buffer:
                 continue
@@ -1034,10 +1083,6 @@ def process_video(video_path: str, output_path: str, filter_type: str = "graysca
         # Check for errors
         if processing_error[0]:
             raise processing_error[0]
-        
-        # Cleanup
-        cap.release()
-        out.release()
         
         # Mux audio back into video if audio was extracted
         if has_audio and audio_temp_path and os.path.exists(audio_temp_path) and ffmpeg_path:
@@ -1083,7 +1128,8 @@ def process_video(video_path: str, output_path: str, filter_type: str = "graysca
                 if audio_temp_path and os.path.exists(audio_temp_path):
                     try:
                         os.remove(audio_temp_path)
-                    except:
+                    except OSError:
+                        # Ignore errors during cleanup (file may already be deleted)
                         pass
         elif has_audio and not ffmpeg_path:
             logger.warning("Audio was detected but FFmpeg is not available. Audio will not be included in output.")
@@ -1094,3 +1140,15 @@ def process_video(video_path: str, output_path: str, filter_type: str = "graysca
     except Exception as e:
         logger.error(f"Error processing video: {str(e)}")
         return False, str(e)
+    finally:
+        # Always release resources to prevent file handle leaks
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception as e:
+                logger.warning(f"Error releasing VideoCapture: {e}")
+        if out is not None:
+            try:
+                out.release()
+            except Exception as e:
+                logger.warning(f"Error releasing VideoWriter: {e}")

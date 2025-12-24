@@ -90,7 +90,11 @@ jobs_lock = threading.Lock()
 def handle_preflight():
     if request.method == "OPTIONS":
         response = jsonify({})
-        response.headers.add("Access-Control-Allow-Origin", "http://localhost:3000")
+        # Get the origin from the request and validate it against allowed origins
+        origin = request.headers.get('Origin')
+        allowed_origins = ['http://localhost:3000', 'http://127.0.0.1:3000']
+        if origin in allowed_origins:
+            response.headers.add("Access-Control-Allow-Origin", origin)
         response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
         response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
         response.headers.add("Access-Control-Max-Age", "3600")
@@ -552,8 +556,15 @@ def serve_video(filename):
         # Ensure the file is actually in the temp directory (prevent directory traversal)
         real_path = os.path.realpath(file_path)
         real_temp_dir = os.path.realpath(temp_dir)
-        if not real_path.startswith(real_temp_dir):
-            return jsonify({"error": "Invalid file path"}), 403
+        # Use commonpath to properly validate containment (prevents bypass via sibling directories)
+        try:
+            if os.path.commonpath([real_path, real_temp_dir]) != real_temp_dir:
+                return jsonify({"error": "Invalid file path"}), 403
+        except ValueError:
+            # commonpath raises ValueError if paths are on different drives (Windows)
+            # Fall back to checking with path separator
+            if not real_path.startswith(real_temp_dir + os.sep) and real_path != real_temp_dir:
+                return jsonify({"error": "Invalid file path"}), 403
         
         # Check if this file is associated with any completed job OR is an uploaded video
         # Uploaded videos start with "uploaded_" prefix
