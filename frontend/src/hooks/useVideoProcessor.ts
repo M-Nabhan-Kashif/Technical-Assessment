@@ -36,7 +36,7 @@ export interface UseVideoProcessorReturn {
   // Actions
   processCurrentFrame: () => Promise<void>;
   processFrameAtTimestamp: (timestamp: number) => Promise<void>;
-  processFullVideo: (videoUrl: string) => Promise<void>;
+  processFullVideo: (videoUrl: string, clipStart?: number, clipEnd?: number, filterType?: FilterType | null, backgroundImage?: string | null) => Promise<void>;
   setFilter: (filter: FilterType) => void;
   clearProcessedFrames: () => void;
   clearError: () => void;
@@ -256,7 +256,7 @@ export function useVideoProcessor(
 
   // Process full video
   const processFullVideo = useCallback(
-    async (videoUrl: string) => {
+    async (videoUrl: string, clipStart?: number, clipEnd?: number, filterType?: FilterType | null, backgroundImage?: string | null) => {
       setState((prev) => ({
         ...prev,
         isProcessingFullVideo: true,
@@ -267,15 +267,47 @@ export function useVideoProcessor(
       }));
 
       try {
+        // Build request body
+        const requestBody: any = {
+          video_url: videoUrl,
+        };
+        
+        // Add filter type (null for clipping only)
+        if (filterType !== null && filterType !== undefined) {
+          requestBody.filter_type = filterType;
+        } else {
+          requestBody.filter_type = null;
+        }
+        
+        // Add clip parameters if provided
+        if (clipStart !== undefined && clipStart !== null) {
+          requestBody.clip_start = clipStart;
+        }
+        if (clipEnd !== undefined && clipEnd !== null) {
+          requestBody.clip_end = clipEnd;
+        }
+        
+        // Add background image if provided
+        if (backgroundImage) {
+          // Check if it's a URL (template image) or base64 (uploaded image)
+          if (backgroundImage.startsWith('http://') || backgroundImage.startsWith('https://')) {
+            // It's a URL - send as-is
+            requestBody.background_image = backgroundImage;
+          } else {
+            // It's base64 data - remove data URL prefix if present
+            const base64Data = backgroundImage.includes(',') 
+              ? backgroundImage.split(',')[1] 
+              : backgroundImage;
+            requestBody.background_image = base64Data;
+          }
+        }
+        
         const response = await fetch(`${apiUrl}/process-video`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
-            video_url: videoUrl,
-            filter_type: state.currentFilter,
-          }),
+          body: JSON.stringify(requestBody),
         });
 
         if (!response.ok) {

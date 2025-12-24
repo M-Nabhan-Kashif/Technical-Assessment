@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, send_from_directory
+from werkzeug.utils import secure_filename
 from flask_cors import CORS
 from dotenv import load_dotenv
 import logging
@@ -38,6 +39,49 @@ try:
 except Exception as e:
     logger.warning(f"Segmentation model initialization deferred: {e}. It will be initialized on first use.")
 
+# Check FFmpeg availability on startup
+def check_ffmpeg_availability():
+    """Check if FFmpeg is available and log status."""
+    from helpers import find_ffmpeg
+    import subprocess
+    
+    ffmpeg_path = find_ffmpeg()
+    
+    if ffmpeg_path:
+        logger.info(f"FFmpeg found at: {ffmpeg_path}")
+        # Test if it works
+        try:
+            result = subprocess.run(
+                [ffmpeg_path, '-version'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                version = result.stdout.split('\n')[0]
+                logger.info(f"FFmpeg is working: {version}")
+                logger.info("Audio preservation is ENABLED")
+                return True
+            else:
+                logger.warning(f"FFmpeg found but returned error code: {result.returncode}")
+        except Exception as e:
+            logger.warning(f"FFmpeg found but not working: {e}")
+    else:
+        logger.warning(
+            "=" * 60 + "\n"
+            "WARNING: FFmpeg not found. Audio will NOT be preserved in processed videos.\n"
+            "To enable audio preservation, install FFmpeg:\n"
+            "  Windows: winget install ffmpeg OR choco install ffmpeg\n"
+            "  macOS: brew install ffmpeg\n"
+            "  Linux: sudo apt-get install ffmpeg\n"
+            "After installation, restart this server.\n"
+            "=" * 60
+        )
+    return False
+
+# Check FFmpeg on startup
+ffmpeg_available = check_ffmpeg_availability()
+
 # Job storage for async video processing
 processing_jobs = {}
 jobs_lock = threading.Lock()
@@ -59,6 +103,59 @@ def hello_world():
     except Exception as e:
         logger.error(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/health", methods=["GET", "OPTIONS"])
+def health_check():
+    """
+    Health check endpoint that reports system status including FFmpeg availability.
+    
+    Returns:
+    {
+        "status": "ok",
+        "ffmpeg": {
+            "available": true/false,
+            "path": "path/to/ffmpeg" or null,
+            "working": true/false,
+            "version": "version string" or null
+        },
+        "audio_support": true/false
+    }
+    """
+    try:
+        from helpers import find_ffmpeg
+        import subprocess
+        
+        ffmpeg_path = find_ffmpeg()
+        ffmpeg_status = {
+            "available": ffmpeg_path is not None,
+            "path": ffmpeg_path,
+            "working": False,
+            "version": None
+        }
+        
+        if ffmpeg_path:
+            try:
+                result = subprocess.run(
+                    [ffmpeg_path, '-version'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    ffmpeg_status["working"] = True
+                    ffmpeg_status["version"] = result.stdout.split('\n')[0]
+            except Exception as e:
+                logger.warning(f"Error testing FFmpeg: {e}")
+        
+        return jsonify({
+            "status": "ok",
+            "ffmpeg": ffmpeg_status,
+            "audio_support": ffmpeg_status["available"] and ffmpeg_status["working"]
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in health check: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 @app.route("/process-frame-with-config", methods=["POST", "OPTIONS"])
@@ -206,7 +303,7 @@ def download_video(url: str, save_path: str) -> bool:
         return False
 
 
-def process_video_async(job_id: str, video_url: str, filter_type: str):
+def process_video_async(job_id: str, video_url: str, filter_type: str, clip_start: float = None, clip_end: float = None, background_image_data: str = None):
     """Process video asynchronously in a background thread."""
     try:
         with jobs_lock:
@@ -240,7 +337,44 @@ def process_video_async(job_id: str, video_url: str, filter_type: str):
                     processing_jobs[job_id]["progress"] = progress
                     processing_jobs[job_id]["message"] = f"Processing video... {progress}%"
         
-        success, message = process_video(temp_input, temp_output, filter_type, progress_callback)
+        # Decode background image if provided
+        background_image = None
+        if background_image_data:
+            try:
+                import numpy as np
+                import cv2
+                
+                # Check if it's a URL (starts with http:// or https://)
+                if background_image_data.startswith(('http://', 'https://')):
+                    # Download image from URL
+                    logger.info(f"Downloading background image from URL: {background_image_data[:50]}...")
+                    response = requests.get(background_image_data, timeout=30)
+                    response.raise_for_status()
+                    image_bytes = response.content
+                else:
+                    # It's base64 data
+                    # Remove data URL prefix if present
+                    bg_data = background_image_data
+                    if "," in bg_data:
+                        bg_data = bg_data.split(",")[1]
+                    
+                    # Decode base64 to bytes
+                    image_bytes = base64.b64decode(bg_data)
+                
+                # Convert bytes to numpy array
+                nparr = np.frombuffer(image_bytes, np.uint8)
+                background_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if background_image is None:
+                    logger.warning("Failed to decode background image, proceeding without it")
+                    background_image = None
+                else:
+                    logger.info(f"Background image loaded successfully: {background_image.shape}")
+            except Exception as e:
+                logger.warning(f"Error processing background image: {e}, proceeding without it")
+                background_image = None
+        
+        success, message = process_video(temp_input, temp_output, filter_type, progress_callback, clip_start, clip_end, background_image)
         
         if success:
             # Generate a URL to serve the processed video
@@ -299,7 +433,9 @@ def process_video_endpoint():
     Request body:
     {
         "video_url": "https://...",
-        "filter_type": "grayscale|sepia|blur"
+        "filter_type": "grayscale|sepia|blur|null" (null for clipping only),
+        "clip_start": 0.0 (optional, in seconds),
+        "clip_end": 10.0 (optional, in seconds)
     }
     
     Returns:
@@ -317,19 +453,35 @@ def process_video_endpoint():
         
         video_url = data.get("video_url", "")
         filter_type = data.get("filter_type", "grayscale")
+        clip_start = data.get("clip_start", None)
+        clip_end = data.get("clip_end", None)
         
-        # Validate filter type
-        valid_filters = ["grayscale", "sepia", "blur"]
+        # Validate filter type (allow null for clipping only)
+        valid_filters = ["grayscale", "sepia", "blur", None, "none"]
         if filter_type not in valid_filters:
             return jsonify({"error": f"Invalid filter_type. Must be one of: {valid_filters}"}), 400
+        
+        # Normalize filter_type: convert "none" or None to None
+        if filter_type in [None, "none"]:
+            filter_type = None
+        
+        # Validate clip times if provided
+        if clip_start is not None and clip_end is not None:
+            if clip_start < 0:
+                return jsonify({"error": "clip_start must be >= 0"}), 400
+            if clip_end <= clip_start:
+                return jsonify({"error": "clip_end must be > clip_start"}), 400
         
         # Generate job ID
         job_id = str(uuid.uuid4())
         
+        # Get background image if provided
+        background_image_data = data.get("background_image", None)
+        
         # Start async processing
         thread = threading.Thread(
             target=process_video_async,
-            args=(job_id, video_url, filter_type)
+            args=(job_id, video_url, filter_type, clip_start, clip_end, background_image_data)
         )
         thread.daemon = True
         thread.start()
@@ -403,17 +555,22 @@ def serve_video(filename):
         if not real_path.startswith(real_temp_dir):
             return jsonify({"error": "Invalid file path"}), 403
         
-        # Also check if this file is associated with any completed job
-        with jobs_lock:
-            file_found = False
-            for job_id, job_data in processing_jobs.items():
-                if job_data.get("file_path") == file_path and job_data.get("status") == "completed":
-                    file_found = True
-                    break
+        # Check if this file is associated with any completed job OR is an uploaded video
+        # Uploaded videos start with "uploaded_" prefix
+        is_uploaded_video = filename.startswith("uploaded_")
         
-        if not file_found:
-            # File exists but not associated with any job - might be orphaned, but we'll still serve it
-            logger.warning(f"Serving video file not associated with any job: {filename}")
+        if not is_uploaded_video:
+            # For processed videos, check if associated with a job
+            with jobs_lock:
+                file_found = False
+                for job_id, job_data in processing_jobs.items():
+                    if job_data.get("file_path") == file_path and job_data.get("status") == "completed":
+                        file_found = True
+                        break
+            
+            if not file_found:
+                # File exists but not associated with any job - might be orphaned, but we'll still serve it
+                logger.warning(f"Serving video file not associated with any job: {filename}")
         
         # Serve the file with appropriate headers for video streaming
         response = send_from_directory(temp_dir, filename, mimetype='video/mp4', as_attachment=False)
@@ -437,6 +594,81 @@ def serve_video(filename):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/upload-video", methods=["POST", "OPTIONS"])
+def upload_video_endpoint():
+    """
+    Upload a video file for processing.
+    
+    Request: multipart/form-data with 'video' field
+    Returns: {
+        "video_url": "http://127.0.0.1:8080/video/uploaded_filename.mp4",
+        "filename": "uploaded_filename.mp4"
+    }
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    try:
+        # Check if video file is in request
+        if 'video' not in request.files:
+            return jsonify({"error": "No video file provided"}), 400
+        
+        video_file = request.files['video']
+        
+        # Check if file was actually selected
+        if video_file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
+        
+        # Validate file type
+        allowed_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v'}
+        file_ext = os.path.splitext(video_file.filename)[1].lower()
+        if file_ext not in allowed_extensions:
+            return jsonify({"error": f"Invalid file type. Allowed: {', '.join(allowed_extensions)}"}), 400
+        
+        # Validate file size (500MB limit)
+        MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+        video_file.seek(0, os.SEEK_END)
+        file_size = video_file.tell()
+        video_file.seek(0)
+        
+        if file_size > MAX_FILE_SIZE:
+            return jsonify({"error": f"File too large. Maximum size: 500MB"}), 400
+        
+        if file_size == 0:
+            return jsonify({"error": "File is empty"}), 400
+        
+        # Generate unique filename
+        unique_id = str(uuid.uuid4())
+        safe_filename = secure_filename(video_file.filename)
+        filename_base, filename_ext = os.path.splitext(safe_filename)
+        unique_filename = f"uploaded_{unique_id}{filename_ext}"
+        
+        # Ensure temp directory exists
+        temp_dir = os.path.join(os.path.dirname(__file__), "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Save file
+        file_path = os.path.join(temp_dir, unique_filename)
+        video_file.save(file_path)
+        
+        logger.info(f"Video uploaded successfully: {unique_filename} ({file_size / (1024*1024):.2f} MB)")
+        
+        # Return video URL
+        video_url = f"http://127.0.0.1:8080/video/{unique_filename}"
+        
+        return jsonify({
+            "video_url": video_url,
+            "filename": unique_filename
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error uploading video: {str(e)}")
+        return jsonify({"error": f"Failed to upload video: {str(e)}"}), 500
+
 
 if __name__ == "__main__":
+    # Re-check FFmpeg if server is restarted
+    if not ffmpeg_available:
+        logger.info("Re-checking FFmpeg availability...")
+        check_ffmpeg_availability()
     app.run(host='0.0.0.0', port=8080, debug=True, use_reloader=False)
